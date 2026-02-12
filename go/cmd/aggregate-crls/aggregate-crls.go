@@ -189,6 +189,22 @@ func loadAndCheckSignatureOfCRL(aPath string, aIssuerCert *x509.Certificate) (*p
 	return crl, shasum[:], err
 }
 
+func normalizedUrlString(u url.URL) string {
+	normalized := u
+
+	unescapedPath, err := url.PathUnescape(normalized.Path)
+	if err == nil {
+		normalized.Path = unescapedPath
+	}
+
+	unescapedQuery, err := url.QueryUnescape(normalized.RawQuery)
+	if err == nil {
+		normalized.RawQuery = unescapedQuery
+	}
+
+	return normalized.String()
+}
+
 func loadAndCheckIssuingDistributionPointOfCRL(aPath string, aFetchUrl string, aPartitionedCrlUrlSet map[string]bool) (bool, error) {
 	// If a CA uses partitioned CRLs, then the fetch URL must appear as a fullName in the
 	// issuingDistributionPoints extension. Moreover, it must be the only URL from the
@@ -215,14 +231,24 @@ func loadAndCheckIssuingDistributionPointOfCRL(aPath string, aFetchUrl string, a
 
 	urls := []string{}
 	found := false
-	for _, url := range crl.TBSCertList.IssuingDPFullNames.URIs {
-		urls = append(urls, url)
-		_, exists := aPartitionedCrlUrlSet[url]
+	parsedFetchUrl, err := url.Parse(aFetchUrl)
+	if err != nil {
+		return false, fmt.Errorf("Error parsing fetch URL: %s", err)
+	}
+	normalizedFetchUrl := normalizedUrlString(*parsedFetchUrl)
+	for _, urlStr := range crl.TBSCertList.IssuingDPFullNames.URIs {
+		urls = append(urls, urlStr)
+		parsedUrl, err := url.Parse(urlStr)
+		if err != nil {
+			continue
+		}
+		normalizedUrl := normalizedUrlString(*parsedUrl)
+		_, exists := aPartitionedCrlUrlSet[normalizedUrl]
 		if exists {
-			if aFetchUrl == url {
+			if normalizedFetchUrl == normalizedUrl {
 				found = true
 			} else {
-				return false, fmt.Errorf("The issuingDistributionPoints extension lists a different known CRL %s", url)
+				return false, fmt.Errorf("The issuingDistributionPoints extension lists a different known CRL %s", urlStr)
 			}
 		}
 	}
@@ -303,7 +329,7 @@ func (ae *AggregateEngine) aggregateCRLWorker(ctx context.Context, wg *sync.Wait
 		partitionedCrlUrls := make(map[string]bool, len(tuple.CrlUrlPaths))
 		if usesPartitionedCrls {
 			for _, url := range tuple.CrlUrlPaths {
-				partitionedCrlUrls[url.Url.String()] = true
+				partitionedCrlUrls[normalizedUrlString(url.Url)] = true
 			}
 		}
 
