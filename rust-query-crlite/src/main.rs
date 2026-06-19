@@ -242,6 +242,21 @@ fn get_sct_ids_and_timestamps(cert: &X509Certificate) -> Vec<([u8; 32], u64)> {
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum FilterKind {
+    Full,
+    Delta,
+}
+
+impl Display for FilterKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            FilterKind::Full => write!(f, "full"),
+            FilterKind::Delta => write!(f, "delta"),
+        }
+    }
+}
+
 enum Filter {
     Clubcard((/* filename */ String, CRLiteClubcard)),
 }
@@ -261,6 +276,45 @@ impl Filter {
     fn name(&self) -> &str {
         match self {
             Filter::Clubcard((name, _)) => name,
+        }
+    }
+
+    /// The issuer SPKI hashes (block ids) enrolled in this filter, taken from
+    /// the clubcard index metadata. Sampling from these guarantees a query
+    /// reaches a real per-issuer block rather than the NotEnrolled fast path.
+    fn issuer_hashes(&self) -> Vec<[u8; 32]> {
+        match self {
+            Filter::Clubcard((_, clubcard)) => clubcard
+                .index()
+                .keys()
+                .filter_map(|k| k.as_slice().try_into().ok())
+                .collect(),
+        }
+    }
+
+    /// Covered (log_id, timestamp) pairs taken from this filter's coverage
+    /// metadata: one pair per CT log, using the midpoint of each covered
+    /// interval. A query carrying one of these is guaranteed to be in-universe
+    /// for this filter.
+    fn coverage_timestamps(&self) -> Vec<([u8; 32], u64)> {
+        match self {
+            Filter::Clubcard((_, clubcard)) => clubcard
+                .universe()
+                .iter()
+                .map(|(log_id, interval)| {
+                    let mid = interval.low.0 + (interval.high.0 - interval.low.0) / 2;
+                    (log_id.0, mid)
+                })
+                .collect(),
+        }
+    }
+
+    /// A full filter has a ".filter" extension; a delta update ends in ".delta".
+    fn kind(&self) -> FilterKind {
+        if self.name().ends_with(".delta") {
+            FilterKind::Delta
+        } else {
+            FilterKind::Full
         }
     }
 
@@ -400,6 +454,175 @@ impl CRLiteDB {
         }
         Status::NotCovered
     }
+}
+
+/// A precomputed, simulated query input for benchmarking `Filter::has`.
+struct BenchInput {
+    issuer_spki_hash: [u8; 32],
+    serial: Vec<u8>,
+    timestamps: Vec<([u8; 32], u64)>,
+}
+
+/// Deterministic SplitMix64 PRNG. We avoid a `rand` dependency and want
+/// reproducible inputs across benchmark runs.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        SplitMix64(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A random 20-byte serial number.
+    fn serial20(&mut self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        while v.len() < 20 {
+            v.extend_from_slice(&self.next_u64().to_le_bytes());
+        }
+        v.truncate(20);
+        v
+    }
+}
+
+/// Microbenchmark `Filter::has` against the live collection of filters using
+/// *simulated* query inputs:
+///   - covered (log_id, timestamp) pairs taken from the full filter's coverage
+///     metadata (coverage only grows over time, so a timestamp covered by the
+///     full filter is in-universe for every later delta too),
+///   - issuer SPKI hashes sampled from each filter's own clubcard index, and
+///   - random 20-byte serial numbers.
+/// Reports the per-filter cost broken out by full filter vs delta update.
+fn bench(
+    db: &CRLiteDB,
+    samples: usize,
+    iters: usize,
+    inputs_per_filter: usize,
+    seed: u64,
+) -> Result<CmdResult, CRLiteDBError> {
+    if db.filters.is_empty() {
+        return Err(CRLiteDBError::from("no filters loaded"));
+    }
+
+    // Source covered timestamps from the full filter's coverage. Since coverage
+    // increases over time, these are in-universe for the deltas as well.
+    let full_filter = db
+        .filters
+        .iter()
+        .find(|f| f.kind() == FilterKind::Full)
+        .ok_or_else(|| CRLiteDBError::from("no full filter found to source coverage from"))?;
+    let timestamp_pool = full_filter.coverage_timestamps();
+
+    if timestamp_pool.is_empty() {
+        return Err(CRLiteDBError::from(
+            "full filter has no coverage metadata",
+        ));
+    }
+
+    let mut rng = SplitMix64::new(seed);
+
+    eprintln!(
+        "Benchmarking Filter::has with simulated inputs: {} input(s)/filter, \
+         {} covered timestamp(s) from {} coverage, random 20-byte serials (seed {})",
+        inputs_per_filter,
+        timestamp_pool.len(),
+        full_filter.name(),
+        seed
+    );
+    eprintln!(
+        "{} sample(s) of {} call(s) each, per filter\n",
+        samples, iters
+    );
+
+    println!(
+        "{:<34} {:<6} {:>10} {:>10} {:>10} {:>10}  {}",
+        "filter", "kind", "min(ns)", "median(ns)", "mean(ns)", "calls", "status tally"
+    );
+
+    for filter in &db.filters {
+        let issuers = filter.issuer_hashes();
+        if issuers.is_empty() {
+            warn!("{}: no issuers in index, skipping", filter.name());
+            continue;
+        }
+
+        // Build the simulated inputs once, outside any timing: a random enrolled
+        // issuer, a random covered timestamp, and a random 20-byte serial.
+        let inputs: Vec<BenchInput> = (0..inputs_per_filter.max(1))
+            .map(|_| {
+                let issuer_spki_hash = issuers[(rng.next_u64() as usize) % issuers.len()];
+                let ts = timestamp_pool[(rng.next_u64() as usize) % timestamp_pool.len()];
+                BenchInput {
+                    issuer_spki_hash,
+                    serial: rng.serial20(),
+                    timestamps: vec![ts],
+                }
+            })
+            .collect();
+
+        // Tally what statuses these inputs produce, so we can confirm the
+        // intended path (covered + enrolled + non-member => Good) is exercised.
+        let (mut good, mut not_covered, mut not_enrolled, mut revoked) = (0, 0, 0, 0);
+        for inp in &inputs {
+            match filter.has(&inp.issuer_spki_hash, &inp.serial, &inp.timestamps) {
+                Status::Good => good += 1,
+                Status::NotCovered => not_covered += 1,
+                Status::NotEnrolled => not_enrolled += 1,
+                Status::Revoked => revoked += 1,
+                Status::Expired => {}
+            }
+        }
+
+        // Warm up to populate caches / branch predictors.
+        for i in 0..iters.min(10_000) {
+            let inp = &inputs[i % inputs.len()];
+            let status = filter.has(&inp.issuer_spki_hash, &inp.serial, &inp.timestamps);
+            std::hint::black_box(status);
+        }
+
+        let mut per_call: Vec<f64> = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let start = std::time::Instant::now();
+            for i in 0..iters {
+                let inp = &inputs[i % inputs.len()];
+                let status = filter.has(
+                    std::hint::black_box(&inp.issuer_spki_hash),
+                    std::hint::black_box(&inp.serial),
+                    std::hint::black_box(&inp.timestamps),
+                );
+                std::hint::black_box(status);
+            }
+            let elapsed = start.elapsed();
+            per_call.push(elapsed.as_nanos() as f64 / iters as f64);
+        }
+
+        per_call.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let min = per_call[0];
+        let median = per_call[per_call.len() / 2];
+        let mean = per_call.iter().sum::<f64>() / per_call.len() as f64;
+
+        println!(
+            "{:<34} {:<6} {:>10.1} {:>10.1} {:>10.1} {:>10}  G:{} NC:{} NE:{} R:{}",
+            filter.name(),
+            filter.kind().to_string(),
+            min,
+            median,
+            mean,
+            iters,
+            good,
+            not_covered,
+            not_enrolled,
+            revoked,
+        );
+    }
+
+    Ok(CmdResult::NoneRevoked)
 }
 
 struct Intermediates(HashMap<IssuerDN, Vec<DERCert>>);
@@ -712,6 +935,24 @@ enum Subcommand {
     X509 { files: Vec<PathBuf> },
     /// Query a certificate by its crt.sh id
     Crtsh { id: String },
+    /// Microbenchmark Filter::has against the loaded filters using simulated
+    /// inputs. Covered timestamps come from the full filter's coverage
+    /// metadata, issuer hashes are sampled from each filter's clubcard index,
+    /// and serials are random. Reports per-filter cost (full vs delta).
+    Bench {
+        /// Number of timing samples collected per filter.
+        #[clap(long, default_value_t = 100)]
+        samples: usize,
+        /// Number of has() calls per sample (cycled over the inputs).
+        #[clap(long, default_value_t = 100_000)]
+        iters: usize,
+        /// Number of distinct simulated query inputs built per filter.
+        #[clap(long, default_value_t = 256)]
+        inputs: usize,
+        /// Seed for the deterministic PRNG (issuer sampling, random serials).
+        #[clap(long, default_value_t = 0)]
+        seed: u64,
+    },
 }
 
 #[derive(PartialEq)]
@@ -770,6 +1011,12 @@ fn main() {
         }
         Subcommand::X509 { ref files } => query_certs(&db, files),
         Subcommand::Crtsh { ref id } => query_crtsh_id(&db, id),
+        Subcommand::Bench {
+            samples,
+            iters,
+            inputs,
+            seed,
+        } => bench(&db, samples, iters, inputs, seed),
     };
 
     match result {
